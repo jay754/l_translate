@@ -1,6 +1,8 @@
 // backend/server.js (ESM)
 import express from "express";
 import "dotenv/config";
+import path from "path";
+import { fileURLToPath } from "url";
 
 const app = express();
 
@@ -55,7 +57,6 @@ app.post("/session", async (req, res) => {
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
         "OpenAI-Beta": "realtime=v1"
-        // "OpenAI-Project": process.env.OPENAI_PROJECT_ID, // only if your org uses Projects
       },
       body: JSON.stringify(body)
     });
@@ -177,5 +178,18 @@ app.post("/translate", async (req, res) => {
   }
 });
 
+// --- Serve React build folder (for production) ---
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+app.use(express.static(path.join(__dirname, "../frontend/build")));
+
+// fallback: serve React for any non-API route
+app.use((req, res) => {
+  res.sendFile(path.join(__dirname, "../frontend/build/index.html"));
+});
+
+
+// --- Start server ---
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`backend running on http://localhost:${PORT}`));
+app.listen(PORT, () => console.log('backend running on http://localhost:${PORT)'));

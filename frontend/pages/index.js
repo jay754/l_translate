@@ -5,69 +5,52 @@ export default function Home() {
   const [connecting, setConnecting] = useState(false);
   const [muted, setMuted] = useState(false);
   const [level, setLevel] = useState(0);
-  const [messages, setMessages] = useState([]); // [{role, text}]
+  const [messages, setMessages] = useState([]);
+
+  // Auto-scroll to bottom when messages update
+  const transcriptRef = useRef(null);
+  useEffect(() => {
+    if (transcriptRef.current) {
+      transcriptRef.current.scrollTop = transcriptRef.current.scrollHeight;
+    }
+  }, [messages]);
 
   const pcRef = useRef(null);
   const micRef = useRef(null);
   const audioElRef = useRef(null);
   const dataChannelRef = useRef(null);
-
   const audioCtxRef = useRef(null);
   const analyserRef = useRef(null);
   const rafRef = useRef(null);
 
-  // Track ongoing assistant items so we can append transcript deltas
-  // itemId -> index in messages[]
-  const itemIndexRef = useRef(new Map());
-  // itemId -> current text buffer (for quick append)
-  const itemTextRef = useRef(new Map());
+  // Track one active assistant item
+  const currentAssistantItem = useRef(null);
 
   function addMessage(role, text) {
-    if (!text) return;
+    if (!text || !text.trim()) return;
     setMessages((prev) => [...prev, { role, text }]);
   }
 
-  // Append/stream text for a given assistant item id
   function appendAssistantDelta(itemId, deltaText) {
     if (!deltaText) return;
 
-    // If this is the first time we see this assistant item, create it
-    if (!itemIndexRef.current.has(itemId)) {
-      const newIndex = messages.length + (pendingAddsRef.current || 0);
-      itemIndexRef.current.set(itemId, newIndex);
-      itemTextRef.current.set(itemId, "");
-      // Queue a new assistant message (empty for now)
-      queueAddAssistantShell(itemId);
+    // If we’re starting a new assistant message
+    if (currentAssistantItem.current === null) {
+      currentAssistantItem.current = itemId;
+      setMessages((prev) => [...prev, { role: "assistant", text: deltaText }]);
+      return;
     }
 
-    // Append to buffer
-    const buf = (itemTextRef.current.get(itemId) || "") + deltaText;
-    itemTextRef.current.set(itemId, buf);
-
-    // Reflect in UI
-    const idx = itemIndexRef.current.get(itemId);
+    // Append delta to the current assistant message
     setMessages((prev) => {
-      if (idx == null) return prev;
       const next = prev.slice();
-      const existing = next[idx];
-      if (!existing) return prev;
-      next[idx] = { role: "assistant", text: buf };
+      const last = next[next.length - 1];
+      if (!last || last.role !== "assistant") return next;
+      next[next.length - 1] = { ...last, text: last.text + deltaText };
       return next;
     });
   }
 
-  // We need a way to insert a placeholder assistant message exactly once
-  const pendingAddsRef = useRef(0);
-  function queueAddAssistantShell(itemId) {
-    pendingAddsRef.current += 1;
-    setMessages((prev) => {
-      pendingAddsRef.current -= 1;
-      // Insert an empty assistant message; it will be filled by deltas
-      return [...prev, { role: "assistant", text: "" }];
-    });
-  }
-
-  // Spacebar toggles mute
   useEffect(() => {
     function onKeyDown(e) {
       if (e.code === "Space" && connected) {
@@ -81,7 +64,6 @@ export default function Home() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [connected, muted]);
 
-  // Mic level meter
   function startMeter(stream) {
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
     if (!AudioCtx) return;
@@ -111,7 +93,9 @@ export default function Home() {
   function stopMeter() {
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
     rafRef.current = null;
-    try { analyserRef.current?.disconnect(); } catch {}
+    try {
+      analyserRef.current?.disconnect();
+    } catch {}
     analyserRef.current = null;
   }
 
@@ -119,7 +103,6 @@ export default function Home() {
     if (connecting || connected) return;
     setConnecting(true);
 
-    // Get ephemeral token from backend (Express or Next API)
     let data;
     try {
       const r = await fetch("http://localhost:3001/session", { method: "POST" });
@@ -138,61 +121,41 @@ export default function Home() {
     const pc = new RTCPeerConnection();
     pcRef.current = pc;
 
-    // Remote audio
     const audioEl = document.createElement("audio");
     audioEl.autoplay = true;
     audioElRef.current = audioEl;
     pc.ontrack = (ev) => (audioEl.srcObject = ev.streams[0]);
 
-    // Debug ICE/connection
     pc.oniceconnectionstatechange = () =>
       console.log("iceConnectionState:", pc.iceConnectionState);
     pc.onconnectionstatechange = () =>
       console.log("connectionState:", pc.connectionState);
 
-    // Mic input
     const mic = await navigator.mediaDevices.getUserMedia({ audio: true });
     micRef.current = mic;
     mic.getTracks().forEach((t) => pc.addTrack(t, mic));
     startMeter(mic);
 
-    // ---- Data channels for text/events ----
     function handleEvent(event) {
-      console.log("RTC DATA:", event.data);
-      // Try to parse JSON; if not, show raw
       let msg = null;
       try {
         msg = JSON.parse(event.data);
       } catch {
-        if (event.data && String(event.data).trim()) {
-          console.log("TEXT (raw):", String(event.data));
-          addMessage("assistant", String(event.data));
-        }
+        const raw = String(event.data || "").trim();
+        if (raw) addMessage("assistant", raw);
         return;
       }
 
-      // Handle audio transcript streaming (assistant output)
       if (msg?.type === "response.audio_transcript.delta") {
-        // The transcript fragment is in msg.delta
-        const itemId = msg.item_id;
-        const deltaText = msg.delta;
-        appendAssistantDelta(itemId, deltaText);
+        appendAssistantDelta(msg.item_id, msg.delta);
         return;
       }
 
       if (msg?.type === "response.audio_transcript.done") {
-        const itemId = msg.item_id;
-        // No action needed; we already appended all deltas
-        // But ensure final text is visible:
-        const finalTranscript = msg.transcript;
-        if (finalTranscript && !itemIndexRef.current.has(itemId)) {
-          // Edge case: if we somehow missed deltas, add final
-          addMessage("assistant", finalTranscript);
-        }
+        currentAssistantItem.current = null;
         return;
       }
 
-      // Generic fallbacks (some runtimes may send text deltas)
       const t1 = msg?.delta?.content?.[0]?.text;
       const t2 = msg?.content?.[0]?.text;
       const t3 = msg?.output_text?.delta;
@@ -200,23 +163,19 @@ export default function Home() {
       const text = t1 || t2 || t3 || t4;
 
       if (typeof text === "string" && text.trim()) {
-        console.log("TEXT:", text);
-        addMessage("assistant", text);
+        appendAssistantDelta("generic", text);
       }
     }
 
-    // Client-initiated channel
     const dc = pc.createDataChannel("oai-events");
     dataChannelRef.current = dc;
     dc.onopen = () => {
       console.log("client datachannel open");
-      // Ask the model to introduce itself (responses will stream as audio + transcript deltas)
       try {
         dc.send(
           JSON.stringify({
             type: "response.create",
             response: {
-              // Keep it English-only in frontend too (backend will enforce, but helps)
               instructions:
                 "Only speak English. Introduce yourself briefly, then wait for the user.",
               modalities: ["audio", "text"],
@@ -229,13 +188,11 @@ export default function Home() {
     };
     dc.onmessage = handleEvent;
 
-    // Server-initiated channel
     pc.ondatachannel = (evt) => {
       console.log("ondatachannel from server:", evt.channel?.label);
       evt.channel.onmessage = handleEvent;
     };
 
-    // Offer → Answer
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
 
@@ -267,7 +224,6 @@ export default function Home() {
   }
 
   function disconnect() {
-    // cleanup
     try {
       micRef.current?.getTracks().forEach((t) => t.stop());
       pcRef.current?.getSenders().forEach((s) => s.track && s.track.stop());
@@ -279,8 +235,7 @@ export default function Home() {
     dataChannelRef.current = null;
     audioElRef.current?.remove?.();
     audioElRef.current = null;
-    itemIndexRef.current.clear();
-    itemTextRef.current.clear();
+    currentAssistantItem.current = null;
     setConnected(false);
     setMuted(false);
     setConnecting(false);
@@ -338,7 +293,6 @@ export default function Home() {
         </div>
       )}
 
-      {/* Mic meter */}
       <div
         style={{
           width: 280,
@@ -361,39 +315,42 @@ export default function Home() {
         />
       </div>
 
-      {/* Transcript */}
       <div
-        style={{
-          width: 420,
-          maxHeight: 360,
-          overflowY: "auto",
-          border: "1px solid #ddd",
-          borderRadius: 8,
-          padding: 8,
-          marginTop: 12,
-          background: "#fafafa",
-        }}
-      >
-        {messages.length === 0 ? (
+      ref={transcriptRef}
+      style={{
+        width: 420,
+        maxHeight: 360,
+        overflowY: "auto",
+        border: "1px solid #ddd",
+        borderRadius: 8,
+        padding: 8,
+        marginTop: 12,
+        background: "#fafafa",
+      }}
+    >
+
+        {messages.filter((m) => (m.text || "").trim()).length === 0 ? (
           <div style={{ color: "#777" }}>No transcript yet…</div>
         ) : (
-          messages.map((m, i) => (
-            <div key={i} style={{ marginBottom: 6 }}>
-              <b
-                style={{
-                  color:
-                    m.role === "assistant"
-                      ? "#2563eb"
-                      : m.role === "system"
-                      ? "#888"
-                      : "#16a34a",
-                }}
-              >
-                {m.role}:
-              </b>{" "}
-              {m.text}
-            </div>
-          ))
+          messages
+            .filter((m) => (m.text || "").trim())
+            .map((m, i) => (
+              <div key={i} style={{ marginBottom: 6 }}>
+                <b
+                  style={{
+                    color:
+                      m.role === "assistant"
+                        ? "#2563eb"
+                        : m.role === "system"
+                        ? "#888"
+                        : "#16a34a",
+                  }}
+                >
+                  {m.role}:
+                </b>{" "}
+                {m.text}
+              </div>
+            ))
         )}
       </div>
     </main>

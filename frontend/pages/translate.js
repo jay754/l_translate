@@ -125,7 +125,7 @@ export default function TranslatePage() {
               </button>
             </div>
             <div style={{ marginTop: 8, fontSize: 12, color: "#666" }}>
-              Selected: <code>{targets.join(", ") || "(none)")}</code>
+              Selected: <code>{targets.join(", ") || "(none)"} </code>
             </div>
           </div>
 
